@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 from functools import partial
 from itertools import batched, tee, zip_longest
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
+from dacite import from_dict
 from typing_extensions import TypedDict
 from yarl import URL
 
@@ -31,9 +33,16 @@ from ..wow_installations import (
 )
 
 
+class JsonDeserializer:
+    @classmethod
+    def from_dict(cls, data: Any) -> Self:
+        return from_dict(data_class=cls, data=data)
+
+
 # Not exhaustive (as you might've guessed).  Reference:
 # https://docs.github.com/en/rest/reference/repos
-class _GithubRepo(TypedDict):
+@dataclass
+class _GithubRepo(JsonDeserializer):
     id: int  # Unique, stable repository ID
     name: str  # the repo in user-or-org/repo
     full_name: str  # user-or-org/repo
@@ -42,7 +51,8 @@ class _GithubRepo(TypedDict):
     html_url: str
 
 
-class _GithubRelease(TypedDict):
+@dataclass
+class _GithubRelease(JsonDeserializer):
     tag_name: str  # Hopefully the version
     published_at: str  # ISO datetime
     assets: list[_GithubRelease_Asset]
@@ -51,7 +61,8 @@ class _GithubRelease(TypedDict):
     prerelease: bool
 
 
-class _GithubRelease_Asset(TypedDict):
+@dataclass
+class _GithubRelease_Asset(JsonDeserializer):
     url: str
     name: str  # filename
     content_type: str  # mime type
@@ -147,11 +158,11 @@ class GithubResolver(BaseResolver):
         candidates = [
             a
             for a in assets
-            if a['state'] == 'uploaded'
-            and a['content_type'] in {'application/zip', 'application/x-zip-compressed'}
-            and a['name'].endswith('.zip')
+            if a.state == 'uploaded'
+            and a.content_type in {'application/zip', 'application/x-zip-compressed'}
+            and a.name.endswith('.zip')
             # TODO: Is there a better way to detect nolib?
-            and '-nolib' not in a['name']
+            and '-nolib' not in a.name
         ]
         if not candidates:
             return None
@@ -239,7 +250,7 @@ class GithubResolver(BaseResolver):
             toc_filenames = {
                 n
                 for n, h in find_archive_addon_tocs(f.filename for f in dynamic_addon_zip.filelist)
-                if h in candidate['name']  # Folder name is a substring of zip name.
+                if h in candidate.name  # Folder name is a substring of zip name.
             }
             if not toc_filenames:
                 continue
@@ -275,7 +286,7 @@ class GithubResolver(BaseResolver):
                 # we could detect where the zip directory starts.
                 following_file_offset = following_file.header_offset if following_file else ''
 
-                logger.debug(f'Fetching {main_toc_filename} from {candidate["name"]}')
+                logger.debug(f'Fetching {main_toc_filename} from {candidate.name}')
                 async with ctx.http.web_client().get(
                     download_url,
                     expire_after=http.CACHE_INDEFINITELY,
@@ -310,12 +321,12 @@ class GithubResolver(BaseResolver):
     ):
         from .._utils.attrs import simple_converter
 
-        logger.debug(f'Looking for match in release.json: {release_json_asset["url"]}')
+        logger.debug(f'Looking for match in release.json: {release_json_asset.url}')
 
         download_headers = self.make_request_headers(HeadersIntent.Download)
 
         async with ctx.http.web_client().get(
-            release_json_asset['url'],
+            release_json_asset.url,
             expire_after=timedelta(days=1),
             headers=download_headers,
             raise_for_status=True,
@@ -368,7 +379,7 @@ class GithubResolver(BaseResolver):
             (
                 a
                 for a in assets
-                if a['name'] == matching_release['filename'] and a['state'] == 'uploaded'
+                if a.name == matching_release['filename'] and a.state == 'uploaded'
             ),
             None,
         )
@@ -379,9 +390,9 @@ class GithubResolver(BaseResolver):
         release: _GithubRelease,
         desired_flavours: tuple[Flavour, ...] | tuple[*tuple[Flavour, ...], None],
     ):
-        assets = release['assets']
+        assets = release.assets
         release_json = next(
-            (a for a in assets if a['name'] == 'release.json' and a['state'] == 'uploaded'),
+            (a for a in assets if a.name == 'release.json' and a.state == 'uploaded'),
             None,
         )
         matcher = (
@@ -403,7 +414,7 @@ class GithubResolver(BaseResolver):
         else:
             repo_url = self.__api_url / 'repos' / defn.alias
 
-        async def get_project():
+        async def get_project() -> _GithubRepo:
             async with ctx.http.web_client().get(
                 repo_url, expire_after=timedelta(hours=1), headers=github_headers
             ) as response:
@@ -411,8 +422,7 @@ class GithubResolver(BaseResolver):
                     raise PkgNonexistent
                 response.raise_for_status()
 
-                project: _GithubRepo = await response.json()
-                return project
+                return _GithubRepo.from_dict(await response.json())
 
         version_eq = defn.strategies[Strategy.VersionEq]
         if version_eq:
@@ -424,7 +434,7 @@ class GithubResolver(BaseResolver):
                 per_page='10'
             )
 
-        async def get_releases():
+        async def get_releases() -> list[_GithubRelease]:
             async with ctx.http.web_client().get(
                 release_url, expire_after=timedelta(minutes=5), headers=github_headers
             ) as response:
@@ -432,10 +442,10 @@ class GithubResolver(BaseResolver):
                     raise PkgFilesMissing('no releases found')
                 response.raise_for_status()
 
-                release_json: _GithubRelease | list[_GithubRelease] = await response.json()
+                release_json = await response.json()
                 if not isinstance(release_json, list):
                     release_json = [release_json]
-                return release_json
+                return [_GithubRelease.from_dict(r) for r in release_json]
 
         releases_coro = asyncio.create_task(get_releases())
         try:
@@ -446,13 +456,13 @@ class GithubResolver(BaseResolver):
 
         # Only users with push access will get draft releases
         # but let's filter them out just in case.
-        releases = [r for r in await releases_coro if r['draft'] is False]
+        releases = [r for r in await releases_coro if r.draft is False]
 
         # Allow pre-releases only if no stable releases exist or explicitly opted into.
         if not defn.strategies[Strategy.AnyReleaseType] and any(
-            r['prerelease'] is False for r in releases
+            r.prerelease is False for r in releases
         ):
-            releases = (r for r in releases if r['prerelease'] is False)
+            releases = (r for r in releases if r.prerelease is False)
 
         releases = iter(releases)
         first_release = next(releases, None)
@@ -494,15 +504,15 @@ class GithubResolver(BaseResolver):
             raise PkgFilesNotMatching(defn.strategies)
 
         return PkgCandidate(
-            id=str(project['id']),
-            slug=project['full_name'].lower(),
-            name=project['name'],
-            description=project['description'] or '',
-            url=project['html_url'],
-            download_url=asset['url'],
-            date_published=datetime.fromisoformat(release['published_at']),
-            version=release['tag_name'],
-            changelog_url=as_plain_text_data_url(release['body']),
+            id=str(project.id),
+            slug=project.full_name.lower(),
+            name=project.name,
+            description=project.description or '',
+            url=project.html_url,
+            download_url=asset.url,
+            date_published=datetime.fromisoformat(release.published_at),
+            version=release.tag_name,
+            changelog_url=as_plain_text_data_url(release.body),
         )
 
     async def catalogue(self):
