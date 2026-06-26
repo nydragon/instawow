@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from functools import partial
 from itertools import batched, tee, zip_longest
-from typing import Any, Literal, Self
+from typing import Any, Literal, Self, TypedDict
 
 from dacite import from_dict
-from typing_extensions import TypedDict
 from yarl import URL
 
 from .. import ctx, http
@@ -49,6 +48,7 @@ class _GithubRepo(JsonDeserializer):
     description: str | None
     url: str
     html_url: str
+    commits_url: str
 
 
 @dataclass
@@ -181,20 +181,20 @@ class GithubResolver(BaseResolver):
         matching_asset = None
 
         for candidate in candidates:
-            logger.debug(f'Looking for match in zip file: {candidate["url"]}')
+            logger.debug(f'Looking for match in zip file: {candidate.url}')
 
             addon_zip_stream = BytesIO()
             dynamic_addon_zip = None
             is_zip_complete = False
 
-            download_url = candidate['url']
+            download_url = candidate.url
 
             # A large enough initial offset that we won't typically have to
             # resort to extracting the ECD.
             directory_offset = str(-25_000)
 
             for _ in range(2):
-                logger.debug(f'Fetching {directory_offset} bytes from {candidate["name"]}')
+                logger.debug(f'Fetching {directory_offset} bytes from {candidate.name}')
 
                 async with ctx.http.web_client().get(
                     download_url,
@@ -406,7 +406,7 @@ class GithubResolver(BaseResolver):
                 return (release, asset)
 
     async def resolve_one(self, defn: Defn, metadata: None):
-        github_headers = self.make_request_headers()
+        github_headers: dict[str, str] = self.make_request_headers()
 
         id_or_alias = defn.id or defn.alias
         if id_or_alias.isdigit():
@@ -467,7 +467,7 @@ class GithubResolver(BaseResolver):
         releases = iter(releases)
         first_release = next(releases, None)
         if first_release is None:
-            raise PkgFilesNotMatching(defn.strategies)
+            return await self.from_source(project, github_headers)
 
         desired_flavours = (ctx.config.config().product['flavour'],)
         if defn.strategies[Strategy.AnyFlavour]:
@@ -513,6 +513,28 @@ class GithubResolver(BaseResolver):
             date_published=datetime.fromisoformat(release.published_at),
             version=release.tag_name,
             changelog_url=as_plain_text_data_url(release.body),
+        )
+
+    async def from_source(
+        self, project: _GithubRepo, github_headers: dict[str, str]
+    ) -> PkgCandidate:
+        async with ctx.http.web_client().get(
+            f'{project.commits_url.replace("{/sha}", "")}?per_page=1',
+            expire_after=timedelta(hours=1),
+            headers=github_headers,
+        ) as response:
+            sha = (await response.json())[0]['sha']
+
+        return PkgCandidate(
+            id=str(project.id),
+            slug=project.full_name.lower(),
+            name=project.name,
+            description=project.description or '',
+            url=project.html_url,
+            download_url='https://github.com/TheMouseNest/Auctionator/archive/refs/heads/master.zip',
+            date_published=datetime.now(tz=UTC),
+            version=sha,
+            changelog_url='',
         )
 
     async def catalogue(self):
